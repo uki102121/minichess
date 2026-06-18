@@ -2,6 +2,10 @@
 #include "search_types.hpp"
 #include "game_history.hpp"
 
+/* alpha-beta bounds local to policy layer (do not modify base_state.hpp) */
+constexpr int ALPHA_MIN = -100001;
+constexpr int ALPHA_MAX = 100001;
+
 struct MMParams {
     bool use_kp_eval = true;
     bool use_eval_mobility = true;

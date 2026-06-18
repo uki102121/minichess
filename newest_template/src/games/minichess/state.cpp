@@ -15,11 +15,11 @@
  *============================================================*/
 
 // KP material (10x scale for fine positional granularity)
-// KP material (pawn..king) - boosted weights for clearer trade evaluation
-static const int kp_material[7] = {0, 30, 80, 85, 95, 300, 1000};
+// KP material (10x scale for fine positional granularity)
+static const int kp_material[7] = {0, 20, 60, 70, 80, 200, 1000};
 
-// Material-only (simple scale) - scaled up for stronger material bias
-static const int simple_material[7] = {0, 3, 9, 10, 11, 30, 100};
+// Material-only (simple scale)
+static const int simple_material[7] = {0, 2, 6, 7, 8, 20, 100};
 
 // Piece-Square Tables (white perspective, mirror for black)
 static const int pst[6][BOARD_H][BOARD_W] = {
@@ -164,8 +164,7 @@ int State::evaluate(
         State tmp(this->board, 1 - this->player);
         tmp.get_legal_actions();
         int oppn_mobility = static_cast<int>(tmp.legal_actions.size());
-        // stronger mobility bonus to prefer active positions
-        bonus += 5 * (self_mobility - oppn_mobility);
+        bonus += 2 * (self_mobility - oppn_mobility);
 
     }
 

@@ -1,6 +1,9 @@
 #include <utility>
 #include "state.hpp"
 #include "minimax.hpp"
+#include <unordered_map>
+#include <algorithm>
+#include <tuple>
 
 
 /*============================================================
@@ -117,6 +120,30 @@ int MiniMax::eval_ctx(
         state->get_legal_actions();
     }
 
+    /* === Transposition table lookup === */
+    struct TTEntry { int depth; int score; int flag; Move best_move; };
+    enum { TT_EXACT=0, TT_LOWER=1, TT_UPPER=2 };
+    static std::unordered_map<uint64_t, TTEntry> tt;
+    uint64_t key = state->hash();
+    auto it = tt.find(key);
+    if(it != tt.end()){
+        const TTEntry &e = it->second;
+        if(e.depth >= depth){
+            if(e.flag == TT_EXACT) {
+                history.pop(state->hash());
+                return e.score;
+            } else if(e.flag == TT_LOWER){
+                if(e.score > alpha) alpha = e.score;
+            } else if(e.flag == TT_UPPER){
+                if(e.score < beta) beta = e.score;
+            }
+            if(alpha >= beta){
+                history.pop(state->hash());
+                return alpha;
+            }
+        }
+    }
+
     /* === Terminal / leaf checks === */
     if(state->game_state == WIN){
         return P_MAX - ply;
@@ -148,7 +175,23 @@ int MiniMax::eval_ctx(
     int best_score = ALPHA_MIN;
     bool first_move = true;
 
-    for(auto& action : state->legal_actions){
+    // Move ordering: prefer TT best move and captures
+    Move tt_best_move;
+    if(it != tt.end()) tt_best_move = it->second.best_move;
+    std::vector<std::pair<int, Move>> ordered;
+    ordered.reserve(state->legal_actions.size());
+    for(auto &action : state->legal_actions){
+        int order = 0;
+        Point to = action.second;
+        int opp = 1 - state->player;
+        if(state->board.board[opp][to.first][to.second]) order += 1000; // capture
+        if(it != tt.end() && action == tt_best_move) order += 2000; // tt move first
+        ordered.push_back({order, action});
+    }
+    std::sort(ordered.begin(), ordered.end(), [](const auto &a, const auto &b){ return a.first > b.first; });
+
+    for(auto &pr : ordered){
+        auto action = pr.second;
         State* next = state->next_state(action);
         bool same = next->same_player_as_parent();
 
@@ -184,10 +227,22 @@ int MiniMax::eval_ctx(
                 alpha = score;
             }
             if(alpha >= beta){
+                // store TT as lower bound
+                TTEntry entry{depth, best_score, TT_LOWER, action};
+                tt[key] = entry;
                 break; /* Beta cutoff */
             }
         }
     }
+
+    // store TT entry
+    int flag = TT_EXACT;
+    if(best_score <= alpha) flag = TT_UPPER;
+    else if(best_score >= beta) flag = TT_LOWER;
+    TTEntry entry{depth, best_score, flag, state->legal_actions.empty() ? Move(Point(0,0),Point(0,0)) : state->legal_actions.empty() ? Move(Point(0,0),Point(0,0)) : state->legal_actions[0]};
+    // but prefer stored best_move if we had one
+    if(it != tt.end() && it->second.best_move.first != std::pair<size_t,size_t>(0,0)) entry.best_move = it->second.best_move;
+    tt[key] = entry;
 
     history.pop(state->hash());
     return best_score;

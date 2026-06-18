@@ -17,8 +17,6 @@ enum GameState { UNKNOWN = 0, WIN, DRAW, NONE };
 /* === Score bounds === */
 constexpr int P_MAX = 100000;
 constexpr int M_MAX = -100000;
-constexpr int ALPHA_MAX = 100001;  /* For alpha-beta pruning bounds */
-constexpr int ALPHA_MIN = -100001;
 
 class BaseState {
 public:
