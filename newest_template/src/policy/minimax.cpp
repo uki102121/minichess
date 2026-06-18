@@ -93,7 +93,6 @@ int MiniMax::quiescence(
 
 /*============================================================
  * MiniMax — eval_ctx
- *
  * Negamax with alpha-beta pruning and optional PVS.
  * Caller manages memory.
  *============================================================*/
@@ -234,7 +233,6 @@ int MiniMax::eval_ctx(
             }
         }
     }
-
     // store TT entry
     int flag = TT_EXACT;
     if(best_score <= alpha) flag = TT_UPPER;
