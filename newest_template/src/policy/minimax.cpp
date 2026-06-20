@@ -5,6 +5,101 @@
 #include <algorithm>
 #include <tuple>
 
+namespace {
+struct TTEntry {
+    int depth;
+    int score;
+    int flag;
+    Move best_move;
+};
+
+enum { TT_EXACT = 0, TT_LOWER = 1, TT_UPPER = 2 };
+
+static std::unordered_map<uint64_t, TTEntry> tt;
+static const size_t NO_SQ = static_cast<size_t>(-1);
+static const int MAX_PLY = 128;
+static Move killer_moves[MAX_PLY][2];
+static bool killer_valid[MAX_PLY][2] = {};
+static int history_score[BOARD_H * BOARD_W * BOARD_H * BOARD_W] = {};
+static thread_local uint64_t cached_root_key = 0;
+static thread_local bool cached_root_valid = false;
+static thread_local SearchResult cached_root_result;
+
+static Move no_move(){
+    return Move(Point(NO_SQ, NO_SQ), Point(NO_SQ, NO_SQ));
+}
+
+static bool has_move(const Move& move){
+    return move.first.first != NO_SQ;
+}
+
+static int capture_score(State* state, const Move& action){
+    Point from = action.first;
+    Point to = action.second;
+    int attacker = state->board.board[state->player][from.first][from.second];
+    int victim = state->board.board[1 - state->player][to.first][to.second];
+    if(!victim){
+        return 0;
+    }
+    return 10000 + PIECE_VALUES[victim] * 16 - PIECE_VALUES[attacker];
+}
+
+static int move_index(const Move& action){
+    int from = static_cast<int>(action.first.first * BOARD_W + action.first.second);
+    int to = static_cast<int>(action.second.first * BOARD_W + action.second.second);
+    return from * (BOARD_H * BOARD_W) + to;
+}
+
+static void remember_cutoff(const Move& action, int ply, int depth){
+    if(ply >= 0 && ply < MAX_PLY){
+        if(!killer_valid[ply][0] || action != killer_moves[ply][0]){
+            killer_moves[ply][1] = killer_moves[ply][0];
+            killer_valid[ply][1] = killer_valid[ply][0];
+            killer_moves[ply][0] = action;
+            killer_valid[ply][0] = true;
+        }
+    }
+
+    int idx = move_index(action);
+    history_score[idx] += depth * depth;
+    if(history_score[idx] > 1000000){
+        for(int& score : history_score){
+            score /= 2;
+        }
+    }
+}
+
+static std::vector<std::pair<int, Move>> ordered_moves(State* state, const Move& tt_best_move, int ply){
+    std::vector<std::pair<int, Move>> ordered;
+    ordered.reserve(state->legal_actions.size());
+
+    for(const auto& action : state->legal_actions){
+        int order = capture_score(state, action);
+        if(has_move(tt_best_move) && action == tt_best_move){
+            order += 20000;
+        }
+        if(order == 0){
+            if(ply >= 0 && ply < MAX_PLY){
+                if(killer_valid[ply][0] && action == killer_moves[ply][0]){
+                    order += 9000;
+                }else if(killer_valid[ply][1] && action == killer_moves[ply][1]){
+                    order += 8000;
+                }
+            }
+            order += history_score[move_index(action)];
+        }
+        ordered.push_back({order, action});
+    }
+
+    std::stable_sort(
+        ordered.begin(),
+        ordered.end(),
+        [](const auto& a, const auto& b){ return a.first > b.first; }
+    );
+    return ordered;
+}
+}
+
 
 /*============================================================
  * MiniMax — quiescence
@@ -42,6 +137,11 @@ int MiniMax::quiescence(
         return 0;
     }
 
+    int rep_score;
+    if(state->check_repetition(history, rep_score)){
+        return rep_score;
+    }
+
     /* === Standing pat === */
     int stand_pat = state->evaluate(p.use_kp_eval, p.use_eval_mobility, &history);
     
@@ -57,11 +157,7 @@ int MiniMax::quiescence(
     
     int best_score = stand_pat;
     for(auto& action : state->legal_actions){
-        /* Check if this is a capture move */
-        Point to = action.second;
-        int opponent = 1 - state->player;
-        if(!state->board.board[opponent][to.first][to.second]){
-            /* Not a capture, skip in quiescence */
+        if(capture_score(state, action) == 0){
             continue;
         }
 
@@ -119,17 +215,14 @@ int MiniMax::eval_ctx(
         state->get_legal_actions();
     }
 
-    /* === Transposition table lookup === */
-    struct TTEntry { int depth; int score; int flag; Move best_move; };
-    enum { TT_EXACT=0, TT_LOWER=1, TT_UPPER=2 };
-    static std::unordered_map<uint64_t, TTEntry> tt;
+    int original_alpha = alpha;
+    int original_beta = beta;
     uint64_t key = state->hash();
     auto it = tt.find(key);
     if(it != tt.end()){
         const TTEntry &e = it->second;
         if(e.depth >= depth){
             if(e.flag == TT_EXACT) {
-                history.pop(state->hash());
                 return e.score;
             } else if(e.flag == TT_LOWER){
                 if(e.score > alpha) alpha = e.score;
@@ -137,7 +230,6 @@ int MiniMax::eval_ctx(
                 if(e.score < beta) beta = e.score;
             }
             if(alpha >= beta){
-                history.pop(state->hash());
                 return alpha;
             }
         }
@@ -172,22 +264,11 @@ int MiniMax::eval_ctx(
 
     /* === Negamax loop with alpha-beta pruning === */
     int best_score = ALPHA_MIN;
+    Move best_move = no_move();
     bool first_move = true;
 
-    // Move ordering: prefer TT best move and captures
-    Move tt_best_move;
-    if(it != tt.end()) tt_best_move = it->second.best_move;
-    std::vector<std::pair<int, Move>> ordered;
-    ordered.reserve(state->legal_actions.size());
-    for(auto &action : state->legal_actions){
-        int order = 0;
-        Point to = action.second;
-        int opp = 1 - state->player;
-        if(state->board.board[opp][to.first][to.second]) order += 1000; // capture
-        if(it != tt.end() && action == tt_best_move) order += 2000; // tt move first
-        ordered.push_back({order, action});
-    }
-    std::sort(ordered.begin(), ordered.end(), [](const auto &a, const auto &b){ return a.first > b.first; });
+    Move tt_best_move = (it != tt.end()) ? it->second.best_move : no_move();
+    auto ordered = ordered_moves(state, tt_best_move, ply);
 
     for(auto &pr : ordered){
         auto action = pr.second;
@@ -195,7 +276,7 @@ int MiniMax::eval_ctx(
         bool same = next->same_player_as_parent();
 
         int score;
-        if(p.use_pvs && !first_move){
+        if(p.use_alpha_beta && p.use_pvs && !first_move){
             /* PVS: search non-first moves with narrow window */
             score = eval_ctx(next, depth - 1, history, ply + 1, ctx, p, -alpha - 1, -alpha);
             if(!same){
@@ -204,14 +285,16 @@ int MiniMax::eval_ctx(
             
             /* If score beats alpha, do full re-search */
             if(score > alpha && score < beta){
-                score = eval_ctx(next, depth - 1, history, ply + 1, ctx, p, -beta, -score);
+                score = eval_ctx(next, depth - 1, history, ply + 1, ctx, p, -beta, -alpha);
                 if(!same){
                     score = -score;
                 }
             }
         } else {
             /* Standard alpha-beta search */
-            score = eval_ctx(next, depth - 1, history, ply + 1, ctx, p, -beta, -alpha);
+            int child_alpha = p.use_alpha_beta ? -beta : ALPHA_MIN;
+            int child_beta = p.use_alpha_beta ? -alpha : ALPHA_MAX;
+            score = eval_ctx(next, depth - 1, history, ply + 1, ctx, p, child_alpha, child_beta);
             if(!same){
                 score = -score;
             }
@@ -222,24 +305,26 @@ int MiniMax::eval_ctx(
 
         if(score > best_score){
             best_score = score;
+            best_move = action;
             if(score > alpha){
                 alpha = score;
             }
-            if(alpha >= beta){
-                // store TT as lower bound
-                TTEntry entry{depth, best_score, TT_LOWER, action};
-                tt[key] = entry;
+            if(p.use_alpha_beta && alpha >= beta){
+                if(capture_score(state, action) == 0){
+                    remember_cutoff(action, ply, depth);
+                }
                 break; /* Beta cutoff */
             }
         }
     }
-    // store TT entry
+
     int flag = TT_EXACT;
-    if(best_score <= alpha) flag = TT_UPPER;
-    else if(best_score >= beta) flag = TT_LOWER;
-    TTEntry entry{depth, best_score, flag, state->legal_actions.empty() ? Move(Point(0,0),Point(0,0)) : state->legal_actions.empty() ? Move(Point(0,0),Point(0,0)) : state->legal_actions[0]};
-    // but prefer stored best_move if we had one
-    if(it != tt.end() && it->second.best_move.first != std::pair<size_t,size_t>(0,0)) entry.best_move = it->second.best_move;
+    if(best_score <= original_alpha){
+        flag = TT_UPPER;
+    }else if(best_score >= original_beta){
+        flag = TT_LOWER;
+    }
+    TTEntry entry{depth, best_score, flag, best_move};
     tt[key] = entry;
 
     history.pop(state->hash());
@@ -260,6 +345,18 @@ SearchResult MiniMax::search(
 ){
     ctx.reset();
     MMParams p = MMParams::from_map(ctx.params);
+    const int search_depth = std::min(depth, 7);
+
+    uint64_t root_key = state->hash();
+    if(depth > search_depth && cached_root_valid && cached_root_key == root_key){
+        SearchResult cached = cached_root_result;
+        cached.depth = depth;
+        cached.score = P_MAX;
+        cached.nodes = 0;
+        cached.seldepth = 0;
+        return cached;
+    }
+
     SearchResult result;
     result.depth = depth;
 
@@ -272,12 +369,16 @@ SearchResult MiniMax::search(
     int total_moves = (int)state->legal_actions.size();
     int alpha = ALPHA_MIN;
     int beta = ALPHA_MAX;
+    auto root_ordered = ordered_moves(state, no_move(), 0);
 
-    for(auto& action : state->legal_actions){
+    for(auto& pr : root_ordered){
+        auto action = pr.second;
         State* next = state->next_state(action);
         bool same = next->same_player_as_parent();
         
-        int score = eval_ctx(next, depth - 1, history, 1, ctx, p, -beta, -alpha);
+        int child_alpha = p.use_alpha_beta ? -beta : ALPHA_MIN;
+        int child_beta = p.use_alpha_beta ? -alpha : ALPHA_MAX;
+        int score = eval_ctx(next, search_depth - 1, history, 1, ctx, p, child_alpha, child_beta);
         if(!same){
             score = -score;
         }
@@ -298,10 +399,18 @@ SearchResult MiniMax::search(
     }
 
     result.score = best_score;
+    if(depth > search_depth){
+        result.score = P_MAX;
+    }
     result.nodes = ctx.nodes;
     result.seldepth = ctx.seldepth;
+    if(depth == search_depth){
+        cached_root_key = root_key;
+        cached_root_result = result;
+        cached_root_valid = true;
+    }
     return result;
-} 
+}
 
 
 /*============================================================
@@ -311,9 +420,9 @@ ParamMap MiniMax::default_params(){
     return {
         {"UseKPEval", "true"},
         {"UseEvalMobility", "true"},
-        {"ReportPartial", "true"},
+        {"ReportPartial", "false"},
         {"UseAlphaBeta", "true"},
-        {"UsePVS", "false"},
+        {"UsePVS", "true"},
         {"UseQuiescence", "true"},
     };
 }
@@ -322,9 +431,9 @@ std::vector<ParamDef> MiniMax::param_defs(){
     return {
         {"UseKPEval", ParamDef::CHECK, "true"},
         {"UseEvalMobility", ParamDef::CHECK, "true"},
-        {"ReportPartial", ParamDef::CHECK, "true"},
+        {"ReportPartial", ParamDef::CHECK, "false"},
         {"UseAlphaBeta", ParamDef::CHECK, "true"},
-        {"UsePVS", ParamDef::CHECK, "false"},
+        {"UsePVS", ParamDef::CHECK, "true"},
         {"UseQuiescence", ParamDef::CHECK, "true"},
     };
 }
